@@ -90,6 +90,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, {"ok": True, "id": log_id})
             if parsed.path == "/api/reconcile":
                 return self._json(200, {"ok": True, "exceptions": self.db.reconcile_date(str(body.get("date", "")))})
+            if parsed.path == "/api/breaking":
+                insert = self.db.register_insert(
+                    str(body.get("air_date", "")), str(body.get("start_time", "")),
+                    str(body.get("end_time", "")), str(body.get("region", "")),
+                    str(body.get("title", "")),
+                )
+                return self._json(201, {"ok": True, "insert": insert})
+            if len(parts) == 4 and parts[:2] == ["api", "breaking"] and parts[3] == "withdraw":
+                insert = self.db.withdraw_insert(int(parts[2]))
+                return self._json(200, {"ok": True, "insert": insert})
+            if len(parts) == 4 and parts[:2] == ["api", "breaking"] and parts[3] == "end":
+                insert = self.db.end_insert(int(parts[2]), str(body.get("actual_end_time", "")))
+                return self._json(200, {"ok": True, "insert": insert})
             if len(parts) == 4 and parts[:2] == ["api", "slots"] and parts[3] == "replace":
                 return self._json(200, {"ok": True, "slot": self.db.replace_slot(int(parts[2]), int(body.get("new_program_id", 0)))})
             if len(parts) == 4 and parts[:2] == ["api", "programs"] and parts[3] == "regions":

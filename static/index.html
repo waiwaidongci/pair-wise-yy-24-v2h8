@@ -8,9 +8,23 @@ section{background:white;padding:16px;margin:12px 0;border:1px solid #ddd;border
 input,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}
 button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;max-height:360px;overflow:auto}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input{width:90%}
+.ok{color:#177245}.bad{color:#b3261e}.muted{color:#777}
+.insert-card{border:1px solid #ccc;border-radius:8px;padding:10px;margin:8px 0;background:#fbfbfa}
+.deferred{padding:6px 10px;border-left:4px solid #999;margin:4px 0}
+.deferred.restored{border-left-color:#177245}.deferred.pending_reschedule{border-left-color:#b3261e}.deferred.deferred{border-left-color:#b8860b}
 </style>
 <h1>电台播出与版权窗口排程</h1>
 <section><h2>当前计划</h2><button onclick="load()">刷新</button><pre id="state"></pre></section>
+<section><h2>新闻插播</h2>
+<div class="grid">
+<input id="bdate" value="2026-09-28"><input id="bregion" value="华东"><input id="btitle" placeholder="插播标题，可空">
+<input id="bstart" value="09:30" placeholder="开始 HH:MM"><input id="bend" value="11:30" placeholder="结束 HH:MM">
+<input id="bid" type="number" placeholder="插播单 ID"><input id="bendtime" value="10:00" placeholder="提前结束时刻 HH:MM">
+</div>
+<button onclick="registerInsert()">登记插播单</button>
+<button onclick="withdrawInsert()">撤回插播</button>
+<button onclick="endInsert()">提前结束</button>
+<div id="inserts"></div></section>
 <section><h2>新建节目</h2><div class="grid">
 <input id="title" placeholder="节目名"><select id="kind"><option>music</option><option>ad</option><option>talk</option><option>live</option></select>
 <input id="duration" type="number" value="30" placeholder="分钟"><input id="start" value="2026-01-01"><input id="end" value="2026-12-31">
@@ -24,7 +38,32 @@ button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;ma
 <script>
 const api=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();out(j);return j};
 const out=x=>document.querySelector('#result').textContent=JSON.stringify(x,null,2);
-async function load(){document.querySelector('#state').textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}
+async function load(){const state=await (await fetch('/api/state')).json();document.querySelector('#state').textContent=JSON.stringify(state,null,2);renderInserts(state.inserts||[])}
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const INSERT_STATUS={active:'进行中',withdrawn:'已撤回',ended:'已结束'};
+const OUTCOME={deferred:'顺延中',restored:'已恢复',pending_reschedule:'待重排'};
+function renderInserts(inserts){
+  document.querySelector('#inserts').innerHTML=inserts.map(ins=>{
+    const end=ins.actual_end_time?` / 实际结束 ${esc(ins.actual_end_time)}`:'';
+    const rows=(ins.deferrals||[]).map(d=>`
+      <div class="deferred ${d.outcome}">
+        排期 #${d.slot_id} ${esc(d.start_time)}-${durationEnd(d.start_time,d.duration_minutes)}
+        《${esc(d.title)}》原状态 ${esc(d.original_status)} → <b>${OUTCOME[d.outcome]||d.outcome}</b>
+        ${d.outcome==='pending_reschedule'?` <span class="bad">原因：${esc(d.reasons)}</span>`:''}
+        ${d.outcome==='restored'?` <span class="ok">已按原时段恢复</span>`:''}
+        ${d.outcome==='deferred'?` <span class="muted">保留原时段，等待撤回或提前结束后复核</span>`:''}
+      </div>`).join('');
+    return `<div class="insert-card">
+      <b>插播单 #${ins.id}</b> ${esc(ins.title||'新闻插播')}｜${esc(ins.region)}｜${esc(ins.air_date)}
+      ${esc(ins.start_time)}-${esc(ins.end_time)}${end}｜${INSERT_STATUS[ins.status]||ins.status}
+      <div>${rows || '<span class="muted">没有覆盖到未播节目（已播排期留在当天）</span>'}</div>
+    </div>`;
+  }).join('');
+}
+function durationEnd(start,minutes){const [h,m]=start.split(':').map(Number);const total=h*60+m+minutes;return String(Math.floor(total/60)%24).padStart(2,'0')+':'+String(total%60).padStart(2,'0')}
+function registerInsert(){api('/api/breaking',{air_date:bdate.value,region:bregion.value,title:btitle.value,start_time:bstart.value,end_time:bend.value}).then(load)}
+function withdrawInsert(){api('/api/breaking/'+bid.value+'/withdraw',{}).then(load)}
+function endInsert(){api('/api/breaking/'+bid.value+'/end',{actual_end_time:bendtime.value}).then(load)}
 function addProgram(){api('/api/programs',{title:title.value,kind:kind.value,duration_minutes:+duration.value,start_date:start.value,end_date:end.value,region:region.value,regions:[region.value],sponsor:sponsor.value||null,cooldown_minutes:+cooldown.value})}
 function schedule(){api('/api/schedule',{air_date:airdate.value,start_time:starttime.value,program_id:+pid.value,region:region.value})}
 function replace(){api('/api/slots/'+sid.value+'/replace',{new_program_id:+newpid.value})}
