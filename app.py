@@ -90,6 +90,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, {"ok": True, "id": log_id})
             if parsed.path == "/api/reconcile":
                 return self._json(200, {"ok": True, "exceptions": self.db.reconcile_date(str(body.get("date", "")))})
+            if parsed.path == "/api/interruptions":
+                result = self.db.register_interruption(
+                    str(body.get("region", "")), str(body.get("air_date", "")),
+                    str(body.get("start_time", "")), str(body.get("end_time", "")),
+                    str(body.get("title", "")),
+                )
+                return self._json(201, {"ok": True, "interruption": result})
+            if len(parts) == 4 and parts[:2] == ["api", "interruptions"] and parts[3] == "release":
+                actual_end = str(body["actual_end_time"]) if body.get("actual_end_time") else None
+                return self._json(200, {"ok": True, "interruption": self.db.release_interruption(int(parts[2]), actual_end)})
             if len(parts) == 4 and parts[:2] == ["api", "slots"] and parts[3] == "replace":
                 return self._json(200, {"ok": True, "slot": self.db.replace_slot(int(parts[2]), int(body.get("new_program_id", 0)))})
             if len(parts) == 4 and parts[:2] == ["api", "programs"] and parts[3] == "regions":

@@ -8,9 +8,27 @@ section{background:white;padding:16px;margin:12px 0;border:1px solid #ddd;border
 input,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}
 button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;max-height:360px;overflow:auto}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input{width:90%}
+.card{border:1px solid #d8d8d2;border-radius:8px;padding:10px;margin:8px 0;background:#fbfbf9}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;margin-right:6px}
+.active{background:#fdecd9;color:#9a4a00}.released{background:#e2efe3;color:#1d5c28}
+.deferred{background:#fff4cf;color:#7a5b00}.restored{background:#e2efe3;color:#1d5c28}
+.pending_reschedule{background:#fbe0e0;color:#8a1f1f}.planned,.replaced{background:#e7edf5;color:#16324f}
+li{margin:3px 0}
 </style>
 <h1>电台播出与版权窗口排程</h1>
 <section><h2>当前计划</h2><button onclick="load()">刷新</button><pre id="state"></pre></section>
+<section><h2>新闻插播占位</h2>
+<div class="grid">
+<input id="inregion" value="华东" placeholder="地区"><input id="indate" value="2026-09-28" placeholder="日期">
+<input id="instart" value="09:30" placeholder="开始 HH:MM"><input id="inend" value="10:30" placeholder="结束 HH:MM">
+<input id="intitle" placeholder="插播标题，可空">
+<input id="inid" type="number" placeholder="撤回用：插播 ID"><input id="inactualend" placeholder="提前结束时刻，可空">
+</div>
+<button onclick="registerInterruption()">登记插播（覆盖未播节目）</button>
+<button onclick="releaseInterruption()">撤回 / 提前结束（复核恢复）</button>
+<div id="interruptions"></div>
+<h3>顺延区 / 待重排</h3><ul id="deferred"></ul>
+<pre id="result"></pre></section>
 <section><h2>新建节目</h2><div class="grid">
 <input id="title" placeholder="节目名"><select id="kind"><option>music</option><option>ad</option><option>talk</option><option>live</option></select>
 <input id="duration" type="number" value="30" placeholder="分钟"><input id="start" value="2026-01-01"><input id="end" value="2026-12-31">
@@ -30,6 +48,38 @@ function schedule(){api('/api/schedule',{air_date:airdate.value,start_time:start
 function replace(){api('/api/slots/'+sid.value+'/replace',{new_program_id:+newpid.value})}
 function playout(){api('/api/playout',{slot_id:+sid.value,actual_start:actualstart.value,actual_duration_minutes:+actualduration.value,actual_program_id:actualpid.value?+actualpid.value:null})}
 function reconcile(){api('/api/reconcile',{date:airdate.value})}
+function registerInterruption(){api('/api/interruptions',{region:inregion.value,air_date:indate.value,start_time:instart.value,end_time:inend.value,title:intitle.value})}
+function releaseInterruption(){api('/api/interruptions/'+inid.value+'/release',{actual_end_time:inactualend.value||null})}
+const STATUS_TEXT={planned:'排播',replaced:'已替换',deferred:'顺延中',pending_reschedule:'待重排',cancelled:'已取消'};
+const ACTION_TEXT={deferred:'转入顺延',restored:'已恢复',pending_reschedule:'待重排'};
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function render(state){
+  const eventsByB={};for(const e of state.events||[]){(eventsByB[e.interruption_id]??=[]).push(e)};
+  const resultBySlot={};
+  for(const list of Object.values(eventsByB)){for(const e of list){if(e.action!=='deferred')resultBySlot[e.slot_id]=e}}
+  document.querySelector('#interruptions').innerHTML=(state.interruptions||[]).map(b=>{
+    const events=eventsByB[b.id]||[];
+    const rows=events.map(e=>{
+      const extra=e.action==='pending_reschedule'?'：'+esc(e.detail):'';
+      return `<li><span class="badge ${e.action}">${ACTION_TEXT[e.action]}</span>#${e.slot_id} ${esc(e.slot_title)} <small>${esc(e.detail)}${extra}</small></li>`;
+    }).join('');
+    const endNote=b.actual_end_time&&b.actual_end_time!==b.end_time?`（实际 ${esc(b.actual_end_time)} 提前结束）`:'';
+    return `<div class="card"><b>#${b.id} ${esc(b.title||'新闻插播')}</b>
+      <span class="badge ${b.status}">${b.status==='active'?'进行中':'已结束'}</span>
+      ${esc(b.region)} ${esc(b.air_date)} ${esc(b.start_time)}–${esc(b.end_time)}${endNote}
+      <ul>${rows||'<li><small>未覆盖任何未播节目</small></li>'}</ul></div>`;
+  }).join('')||'<p><small>暂无插播单</small></p>';
+  document.querySelector('#deferred').innerHTML=(state.slots||[])
+    .filter(s=>s.status==='deferred'||s.status==='pending_reschedule')
+    .map(s=>{
+      const r=resultBySlot[s.id];
+      const note=s.status==='pending_reschedule'?` — ${esc(s.pending_reason)}`:'';
+      return `<li><span class="badge ${s.status}">${STATUS_TEXT[s.status]}</span>#${s.id} ${esc(s.title)}
+        原时段 ${esc(s.air_date)} ${esc(s.start_time)}（插播 #${s.interruption_id}）${note}</li>`;
+    }).join('')||'<li><small>顺延区为空</small></li>';
+}
+async function load(){const state=await (await fetch('/api/state')).json();
+  document.querySelector('#state').textContent=JSON.stringify(state,null,2);render(state)}
 load();
 </script>
 </html>

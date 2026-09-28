@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
+from interruptions import DEFERRED_STATUS, LIVE_STATUSES, PENDING_STATUS, covered_slots, review_slot
+
 
 class DomainError(ValueError):
     """A business-rule violation that should be shown to the API caller."""
@@ -88,6 +90,29 @@ class RadioDB:
               sponsor TEXT PRIMARY KEY,
               min_gap_minutes INTEGER NOT NULL CHECK(min_gap_minutes >= 0)
             );
+            CREATE TABLE IF NOT EXISTS interruptions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              region TEXT NOT NULL,
+              air_date TEXT NOT NULL,
+              start_time TEXT NOT NULL,
+              end_time TEXT NOT NULL,
+              actual_end_time TEXT,
+              title TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'active'
+                CHECK(status IN ('active','released')),
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_interruptions_date_region ON interruptions(air_date, region);
+            CREATE TABLE IF NOT EXISTS interruption_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              interruption_id INTEGER NOT NULL,
+              slot_id INTEGER NOT NULL,
+              slot_title TEXT NOT NULL DEFAULT '',
+              action TEXT NOT NULL CHECK(action IN ('deferred','restored','pending_reschedule')),
+              detail TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_interruption ON interruption_events(interruption_id, id);
             CREATE TABLE IF NOT EXISTS slots (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               air_date TEXT NOT NULL,
@@ -96,8 +121,11 @@ class RadioDB:
               program_id INTEGER NOT NULL REFERENCES programs(id),
               region TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'planned'
-                CHECK(status IN ('planned','replaced','cancelled')),
+                CHECK(status IN ('planned','replaced','cancelled','deferred','pending_reschedule')),
               replaced_from INTEGER REFERENCES programs(id),
+              interruption_id INTEGER REFERENCES interruptions(id),
+              pre_defer_status TEXT,
+              pending_reason TEXT NOT NULL DEFAULT '',
               created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_slots_date_region ON slots(air_date, region);
@@ -121,7 +149,43 @@ class RadioDB:
             );
             """
         )
+        self._migrate_slots()
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_slots_interruption ON slots(interruption_id)")
         self.conn.commit()
+
+    def _migrate_slots(self) -> None:
+        """旧版数据库的 slots 没有顺延状态和插播字段，需要按 SQLite 规范重建表。"""
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(slots)").fetchall()}
+        if not cols or {"interruption_id", "pre_defer_status", "pending_reason"} <= cols:
+            return  # 空库或本次建表脚本创建的新库，无需迁移
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        self.conn.executescript(
+            """
+            CREATE TABLE slots_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              air_date TEXT NOT NULL,
+              start_time TEXT NOT NULL,
+              duration_minutes INTEGER NOT NULL CHECK(duration_minutes > 0),
+              program_id INTEGER NOT NULL REFERENCES programs(id),
+              region TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'planned'
+                CHECK(status IN ('planned','replaced','cancelled','deferred','pending_reschedule')),
+              replaced_from INTEGER REFERENCES programs(id),
+              interruption_id INTEGER REFERENCES interruptions(id),
+              pre_defer_status TEXT,
+              pending_reason TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            INSERT INTO slots_new(id,air_date,start_time,duration_minutes,program_id,region,status,
+                                  replaced_from,created_at)
+            SELECT id,air_date,start_time,duration_minutes,program_id,region,status,replaced_from,created_at FROM slots;
+            DROP TABLE slots;
+            ALTER TABLE slots_new RENAME TO slots;
+            CREATE INDEX idx_slots_date_region ON slots(air_date, region);
+            CREATE INDEX idx_slots_interruption ON slots(interruption_id);
+            """
+        )
+        self.conn.execute("PRAGMA foreign_keys=ON")
 
     def seed_demo(self) -> None:
         existing = self.conn.execute("SELECT COUNT(*) FROM programs").fetchone()[0]
@@ -223,8 +287,17 @@ class RadioDB:
         for window in blocked:
             if _minutes(window["start_time"]) < end_minutes and _minutes(start_time) < _minutes(window["end_time"]):
                 raise DomainError(f"与禁播时段冲突: {window['reason']}")
-        sql = "SELECT * FROM slots WHERE air_date=? AND region=? AND status!='cancelled'"
-        params: list[object] = [air_date, region]
+        active_interruptions = self.conn.execute(
+            "SELECT * FROM interruptions WHERE air_date=? AND region=? AND status='active'",
+            (air_date, region),
+        ).fetchall()
+        for bulletin in active_interruptions:
+            if _overlap(start_time, duration, bulletin["start_time"],
+                        _minutes(bulletin["end_time"]) - _minutes(bulletin["start_time"])):
+                raise DomainError(f"与新闻插播 #{bulletin['id']} 占位时段冲突")
+        live_clause = f"status IN ({','.join('?' for _ in LIVE_STATUSES)})"
+        sql = f"SELECT * FROM slots WHERE air_date=? AND region=? AND {live_clause}"
+        params: list[object] = [air_date, region, *LIVE_STATUSES]
         if ignore_slot_id is not None:
             sql += " AND id!=?"
             params.append(ignore_slot_id)
@@ -233,9 +306,9 @@ class RadioDB:
                 raise DomainError(f"与排期 #{existing['id']} 时间重叠")
         if program["cooldown_minutes"]:
             previous = self.conn.execute(
-                "SELECT * FROM slots WHERE air_date=? AND region=? AND program_id=? AND status!='cancelled' AND id!=? "
+                f"SELECT * FROM slots WHERE air_date=? AND region=? AND program_id=? AND {live_clause} AND id!=? "
                 "AND start_time < ? ORDER BY start_time DESC LIMIT 1",
-                (air_date, region, program_id, ignore_slot_id or -1, start_time),
+                (air_date, region, program_id, *LIVE_STATUSES, ignore_slot_id or -1, start_time),
             ).fetchone()
             if previous:
                 gap = _minutes(start_time) - (_minutes(previous["start_time"]) + previous["duration_minutes"])
@@ -247,8 +320,8 @@ class RadioDB:
                 gap = policy["min_gap_minutes"]
                 all_sponsored = self.conn.execute(
                     "SELECT s.*, p.sponsor FROM slots s JOIN programs p ON p.id=s.program_id "
-                    "WHERE s.air_date=? AND s.region=? AND s.status!='cancelled' AND p.sponsor=? AND s.id!=?",
-                    (air_date, region, program["sponsor"], ignore_slot_id or -1),
+                    f"WHERE s.air_date=? AND s.region=? AND {live_clause} AND p.sponsor=? AND s.id!=?",
+                    (air_date, region, *LIVE_STATUSES, program["sponsor"], ignore_slot_id or -1),
                 ).fetchall()
                 for other in all_sponsored:
                     if _overlap(start_time, duration, other["start_time"], other["duration_minutes"]):
@@ -294,6 +367,189 @@ class RadioDB:
             raise DomainError("排期不存在")
         return dict(row)
 
+    def _check_time_window(self, air_date: str, start_time: str, end_time: str) -> int:
+        try:
+            datetime.strptime(air_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise DomainError("播出日期必须使用 YYYY-MM-DD") from exc
+        try:
+            start, end = _minutes(start_time), _minutes(end_time)
+        except ValueError as exc:
+            raise DomainError("时间必须使用 HH:MM") from exc
+        if start >= end:
+            raise DomainError("插播结束时刻必须晚于开始时刻")
+        return end - start
+
+    def register_interruption(self, region: str, air_date: str, start_time: str, end_time: str,
+                              title: str = "") -> dict:
+        """登记一张新闻插播占位单：覆盖到的未播节目转入顺延区，已播排期留在当天。"""
+        region = region.strip()
+        if not region:
+            raise DomainError("地区不能为空")
+        self._check_time_window(air_date, start_time, end_time)
+        b_start, b_end = _minutes(start_time), _minutes(end_time)
+        with self.transaction():
+            for active in self.conn.execute(
+                "SELECT * FROM interruptions WHERE air_date=? AND region=? AND status='active'",
+                (air_date, region),
+            ).fetchall():
+                if b_start < _minutes(active["end_time"]) and _minutes(active["start_time"]) < b_end:
+                    raise DomainError(f"与进行中的插播 #{active['id']} 时段重叠")
+            rows = self.conn.execute(
+                "SELECT s.*, p.title, EXISTS(SELECT 1 FROM playout_logs l WHERE l.slot_id=s.id) AS has_played "
+                "FROM slots s JOIN programs p ON p.id=s.program_id WHERE s.air_date=? AND s.region=?",
+                (air_date, region),
+            ).fetchall()
+            slots = [{**dict(row), "start_minutes": _minutes(row["start_time"])} for row in rows]
+            hit = covered_slots(slots, b_start, b_end)
+            cur = self.conn.execute(
+                "INSERT INTO interruptions(region,air_date,start_time,end_time,title,created_at) VALUES(?,?,?,?,?,?)",
+                (region, air_date, start_time, end_time, title.strip(), datetime.now().isoformat()),
+            )
+            interruption_id = int(cur.lastrowid)
+            now = datetime.now().isoformat()
+            for slot in hit:
+                self.conn.execute(
+                    "UPDATE slots SET status=?, interruption_id=?, pre_defer_status=? WHERE id=?",
+                    (DEFERRED_STATUS, interruption_id, slot["status"], slot["id"]),
+                )
+                self.conn.execute(
+                    "INSERT INTO interruption_events(interruption_id,slot_id,slot_title,action,detail,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (interruption_id, slot["id"], slot["title"], "deferred",
+                     f"{slot['start_time']} 起 {slot['duration_minutes']} 分钟", now),
+                )
+        return self.get_interruption(interruption_id)
+
+    def get_interruption(self, interruption_id: int) -> dict:
+        bulletin = self.conn.execute(
+            "SELECT * FROM interruptions WHERE id=?", (interruption_id,)
+        ).fetchone()
+        if not bulletin:
+            raise DomainError("插播单不存在")
+        slots = [dict(row) for row in self.conn.execute(
+            "SELECT s.*, p.title, p.kind, p.sponsor FROM slots s JOIN programs p ON p.id=s.program_id "
+            "WHERE s.interruption_id=? ORDER BY s.start_time", (interruption_id,)
+        ).fetchall()]
+        return {**dict(bulletin), "slots": slots}
+
+    def release_interruption(self, interruption_id: int, actual_end_time: str | None = None) -> dict:
+        """撤回或提前结束插播：受影响节目在原时段复核，通过则恢复，冲突则留在待重排。"""
+        with self.transaction():
+            bulletin = self.conn.execute(
+                "SELECT * FROM interruptions WHERE id=?", (interruption_id,)
+            ).fetchone()
+            if not bulletin:
+                raise DomainError("插播单不存在")
+            if bulletin["status"] != "active":
+                raise DomainError("插播已经结束，不能重复撤回")
+            end_time = actual_end_time or bulletin["end_time"]
+            try:
+                end_minutes = _minutes(end_time)
+            except ValueError as exc:
+                raise DomainError("时间必须使用 HH:MM") from exc
+            if not (_minutes(bulletin["start_time"]) <= end_minutes <= _minutes(bulletin["end_time"])):
+                raise DomainError("实际结束时刻必须在插播开始与原定结束之间")
+            weekday = datetime.strptime(bulletin["air_date"], "%Y-%m-%d").date().weekday()
+            deferred = [dict(row) for row in self.conn.execute(
+                "SELECT s.*, p.title, p.kind FROM slots s JOIN programs p ON p.id=s.program_id "
+                "WHERE s.interruption_id=? AND s.status=? ORDER BY s.start_time",
+                (interruption_id, DEFERRED_STATUS),
+            ).fetchall()]
+            now = datetime.now().isoformat()
+            restored, pending = [], []
+            for slot in deferred:
+                has_played = self.conn.execute(
+                    "SELECT 1 FROM playout_logs WHERE slot_id=?", (slot["id"],)
+                ).fetchone()
+                if has_played:
+                    # 顺延期间节目其实已经播过，直接回到当天排播单，不再复核。
+                    self.conn.execute(
+                        "UPDATE slots SET status=?, pending_reason='' WHERE id=?",
+                        (slot["pre_defer_status"] or "planned", slot["id"]),
+                    )
+                    self.conn.execute(
+                        "INSERT INTO interruption_events(interruption_id,slot_id,slot_title,action,detail,created_at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (interruption_id, slot["id"], slot["title"], "restored",
+                         "顺延期间已有实播记录，直接回到当天", now),
+                    )
+                    restored.append({"slot_id": slot["id"], "title": slot["title"]})
+                    continue
+                program = self.conn.execute(
+                    "SELECT * FROM programs WHERE id=?", (slot["program_id"],)
+                ).fetchone()
+                regions = [r["region"] for r in self.conn.execute(
+                    "SELECT region FROM program_regions WHERE program_id=?", (slot["program_id"],)
+                ).fetchall()]
+                blocked = [{**dict(w), "start_minutes": _minutes(w["start_time"]),
+                            "end_minutes": _minutes(w["end_time"])}
+                           for w in self.conn.execute(
+                    "SELECT * FROM blocked_windows WHERE region=?", (slot["region"],)
+                ).fetchall()]
+                live_rows = self.conn.execute(
+                    "SELECT s.id,s.start_time,s.duration_minutes,p.sponsor FROM slots s "
+                    "JOIN programs p ON p.id=s.program_id WHERE s.air_date=? AND s.region=? AND s.id!=? "
+                    f"AND s.status IN ({','.join('?' for _ in LIVE_STATUSES)})",
+                    (slot["air_date"], slot["region"], slot["id"], *LIVE_STATUSES),
+                ).fetchall()
+                live_slots = [{**dict(r), "start_minutes": _minutes(r["start_time"])} for r in live_rows]
+                gap_row = None
+                sponsored_slots: list[dict] = []
+                if program and program["sponsor"]:
+                    gap_row = self.conn.execute(
+                        "SELECT min_gap_minutes FROM sponsor_policies WHERE sponsor=?",
+                        (program["sponsor"],),
+                    ).fetchone()
+                    sponsored_rows = self.conn.execute(
+                        "SELECT s.id,s.start_time,s.duration_minutes,p.sponsor FROM slots s "
+                        "JOIN programs p ON p.id=s.program_id WHERE s.air_date=? AND s.region=? AND s.id!=? "
+                        f"AND s.status IN ({','.join('?' for _ in LIVE_STATUSES)}) AND p.sponsor=?",
+                        (slot["air_date"], slot["region"], slot["id"], *LIVE_STATUSES, program["sponsor"]),
+                    ).fetchall()
+                    sponsored_slots = [{**dict(r), "start_minutes": _minutes(r["start_time"])} for r in sponsored_rows]
+                slot_view = {**slot, "start_minutes": _minutes(slot["start_time"]), "weekday": weekday}
+                reasons = review_slot(
+                    slot_view, program, regions, blocked, live_slots, sponsored_slots,
+                    gap_row["min_gap_minutes"] if gap_row else None,
+                )
+                if reasons:
+                    detail = "；".join(reasons)
+                    self.conn.execute(
+                        "UPDATE slots SET status=?, pending_reason=? WHERE id=?",
+                        (PENDING_STATUS, detail, slot["id"]),
+                    )
+                    self.conn.execute(
+                        "INSERT INTO interruption_events(interruption_id,slot_id,slot_title,action,detail,created_at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (interruption_id, slot["id"], slot["title"], "pending_reschedule", detail, now),
+                    )
+                    pending.append({"slot_id": slot["id"], "title": slot["title"], "reasons": reasons})
+                else:
+                    self.conn.execute(
+                        "UPDATE slots SET status=?, pending_reason='' WHERE id=?",
+                        (slot["pre_defer_status"] or "planned", slot["id"]),
+                    )
+                    self.conn.execute(
+                        "INSERT INTO interruption_events(interruption_id,slot_id,slot_title,action,detail,created_at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (interruption_id, slot["id"], slot["title"], "restored",
+                         f"原时段 {slot['start_time']} 复核通过", now),
+                    )
+                    live_slots.append({"id": slot["id"], "start_minutes": slot_view["start_minutes"],
+                                       "duration_minutes": slot["duration_minutes"],
+                                       "sponsor": program["sponsor"] if program else None})
+                    sponsored_slots.append(live_slots[-1])
+                    restored.append({"slot_id": slot["id"], "title": slot["title"]})
+            self.conn.execute(
+                "UPDATE interruptions SET status='released', actual_end_time=? WHERE id=?",
+                (end_time, interruption_id),
+            )
+        result = self.get_interruption(interruption_id)
+        result["restored"] = restored
+        result["pending"] = pending
+        return result
+
     def record_playout(self, slot_id: int, actual_start: str, actual_duration_minutes: int,
                        actual_program_id: int | None = None, note: str = "") -> int:
         if not self.conn.execute("SELECT 1 FROM slots WHERE id=?", (slot_id,)).fetchone():
@@ -318,7 +574,8 @@ class RadioDB:
             self.conn.execute("DELETE FROM reconciliation_exceptions WHERE air_date=?", (air_date,))
             slots = self.conn.execute(
                 "SELECT s.*, p.title, p.sponsor, p.kind FROM slots s JOIN programs p ON p.id=s.program_id "
-                "WHERE s.air_date=? AND s.status!='cancelled' ORDER BY s.start_time", (air_date,)
+                f"WHERE s.air_date=? AND s.status IN ({','.join('?' for _ in LIVE_STATUSES)}) ORDER BY s.start_time",
+                (air_date, *LIVE_STATUSES),
             ).fetchall()
             exceptions: list[tuple[int, str, str]] = []
             for slot in slots:
@@ -361,6 +618,14 @@ class RadioDB:
         slots = [dict(row) for row in self.conn.execute(
             "SELECT s.*, p.title, p.kind FROM slots s JOIN programs p ON p.id=s.program_id ORDER BY s.air_date,s.start_time"
         ).fetchall()]
-        return {"programs": programs, "slots": slots, "exceptions": [dict(row) for row in self.conn.execute(
+        interruptions = [dict(row) for row in self.conn.execute(
+            "SELECT * FROM interruptions ORDER BY id DESC"
+        ).fetchall()]
+        covered = [dict(row) for row in self.conn.execute(
+            "SELECT e.* FROM interruption_events e JOIN interruptions i ON i.id=e.interruption_id "
+            "ORDER BY e.interruption_id, e.id"
+        ).fetchall()]
+        return {"programs": programs, "slots": slots, "interruptions": interruptions, "events": covered,
+                "exceptions": [dict(row) for row in self.conn.execute(
             "SELECT * FROM reconciliation_exceptions ORDER BY id DESC LIMIT 50"
         ).fetchall()]}
